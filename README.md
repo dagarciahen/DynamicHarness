@@ -12,7 +12,7 @@
 </p>
 
 <p align="center">
-  <img alt="python >=3.12" src="https://img.shields.io/badge/python-%3E%3D3.12-3776AB?logo=python&logoColor=white">
+  <a href="https://www.python.org/downloads/"><img alt="python >=3.12" src="https://img.shields.io/badge/python-%3E%3D3.12-3776AB?logo=python&logoColor=white"></a>
   <img alt="version 1.0.1" src="https://img.shields.io/badge/version-1.0.1-007EC6">
 </p>
 
