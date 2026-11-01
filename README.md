@@ -53,7 +53,7 @@ File read/write, shell execution, tests, and permissions are governed outside th
 ## Quick start
 
 ```bash
-git clone <this-repo>
+git clone https://github.com/dagarciahen/DynamicHarness
 cd DynamicHarness
 uv sync --group dev
 ```
