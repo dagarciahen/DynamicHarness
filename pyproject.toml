@@ -1,0 +1,153 @@
+[build-system]
+requires = ["setuptools==80.9.0", "setuptools-scm==9.2.2"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "DynamicHarness"
+version = "1.0.1"
+description = "Hand-written agent harness with dynamic local/cloud model routing and on-demand Skills"
+readme = {file = "README.md", content-type = "text/markdown"}
+requires-python = ">=3.12"
+authors = [
+    {name = "lin"},
+]
+keywords = ["agent", "workflow", "ai", "llm", "smolagents"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+dependencies = [
+    # Core framework
+    "litellm>=1.72.0",
+    # MCP is a platform capability, independent of the selected Agent runtime.
+    "mcp>=1.26.0,<2",
+    "mcpadapt>=0.1.0,<1",
+    # OpenAI-compatible clients are also used by the runtime integration.
+    "openai>=2.8.1,<3.0.0",
+    # Monitoring and tracing
+    "langfuse>=2.0.0,<3.0.0",
+    "opentelemetry-sdk==1.26.0",
+    "opentelemetry-exporter-otlp==1.26.0",
+    "openinference-instrumentation>=0.1.42",
+    "sentry-sdk>=2.35.1",
+    "psutil>=7.0.0",
+    # Config and logging
+    "pyyaml>=6.0.0",
+    "pydantic>=2.7.0",
+    "rich>=14.2.0",
+    "tenacity>=9.1.2",
+    # Network and IO
+    "httpx>=0.27.2",
+    "requests>=2.32.3",
+    "aiohttp>=3.11.11",
+    "beautifulsoup4>=4.14.2",
+    # Shared Shell governance, including native runtime tool calls.
+    "tree-sitter>=0.25.2",
+    "tree-sitter-bash>=0.25.1",
+    "pathspec>=0.12.0",
+    # CLI
+    "click>=8.1.0",
+    "croniter>=6.0.0,<7.0.0",
+    # Misc tools
+    "GitPython>=3.1.43",
+    "docker>=7.1.0",
+    "fire>=0.7.0",
+    "arrow>=1.3.0",
+    "snowflake-id>=1.0.2",
+    "datasets>=3.6.0",
+    "packaging>=24.2",
+    "python-frontmatter>=1.1.0",
+    "sandbox-fusion>=0.1.0",
+    "websocket-client>=1.9.0",
+    "ruff>=0.3.0",
+    "shellcheck-py>=0.10.0.1",
+    "diff-match-patch>=20241021",
+    # Platform specific
+    "pexpect>=4.9.0",
+    "wexpect>=4.0.0 ; sys_platform == 'win32'",
+    "jsonschema>=4.25.1,<5",
+]
+
+[project.optional-dependencies]
+smol = [
+    # Context propagation patches a verified 1.26.0 private timeout boundary.
+    "smolagents[litellm,mcp,openai,telemetry]==1.26.0",
+    "openinference-instrumentation-smolagents>=0.1.4",
+    "ripgrep>=15.0.0",
+]
+# Professional code tools are selected independently of the Agent runtime.
+code = [
+    "ripgrep>=15.0.0",
+    "networkx>=3.0,<4.0",
+    "grep-ast>=0.3.0",
+    "tree-sitter-language-pack>=0.13.0",
+]
+dev = [
+    "pytest>=8.3.5",
+    "pytest-cov>=6.1.1",
+    "pytest-mock>=3.12.0",
+]
+lint = [
+    "black>=24.0.0",
+    "mypy>=1.8.0",
+]
+
+[project.scripts]
+loom = "dynamicharness.__main__:main"
+dynamicharness = "dynamicharness.__main__:main"
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.package-dir]
+dynamicharness = "src"
+
+[tool.setuptools.package-data]
+dynamicharness = ["**/*.yaml", "**/*.yml", "**/*.j2", "**/*.md", "**/*.scm"]
+
+[tool.setuptools.exclude-package-data]
+dynamicharness = ["**/node_modules/**", "**/dist/**", "**/.dynamicharness-install.*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+addopts = ["-v", "--tb=short"]
+markers = ["timeout(seconds): declare the maximum expected duration for a test"]
+
+[tool.black]
+line-length = 120
+target-version = ["py312"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "I", "UP", "B"]
+ignore = ["E501"]
+
+[tool.ruff.lint.per-file-ignores]
+"__init__.py" = ["F401"]
+
+[tool.mypy]
+python_version = "3.12"
+ignore_missing_imports = true
+
+[dependency-groups]
+build = ["setuptools==80.9.0", "setuptools-scm==9.2.2"]
+dev = [
+    "pytest>=8.3.5",
+    "pytest-cov>=6.1.1",
+]
+
+[tool.uv]
+constraint-dependencies = [
+    "grpcio>=1.75.1 ; python_version >= '3.14'",
+    "graphql-core<3.3",
+    "sqlean-py>=3.50.4.5 ; python_version >= '3.14' and sys_platform != 'win32'",
+    "tiktoken>=0.14.0 ; python_version >= '3.14'",
+]

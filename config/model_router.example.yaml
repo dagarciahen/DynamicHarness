@@ -1,0 +1,93 @@
+# Dynamic local/cloud model routing policy.
+#
+# Copy this file to config/model_router.yaml and set `enabled: true` to
+# activate dynamic routing. When the file is absent or disabled, agents keep
+# resolving a single model_type exactly as before, so routing is opt-in.
+routing:
+  enabled: false
+
+  # Pool used when no task class matches.
+  default_pool: cloud
+
+  # The local backend is considered overloaded above this fraction (0.0..1.0).
+  local_max_load: 0.9
+
+  # Last resort when every preferred path is blocked: cloud | local | error.
+  final_resort: cloud
+
+  # Named model pools. Every model_type must exist in config/model.yaml.
+  pools:
+    local:
+      local: true
+      model_types:
+        - ollama
+    cloud:
+      local: false
+      model_types:
+        - powerful
+        - fast
+
+  # Task buckets, matched case-insensitively against the turn text, tool names
+  # and instructions. Patterns are Python regular expressions (single-quoted
+  # YAML keeps backslashes literal). First match wins, so `simple` precedes the
+  # heavier buckets: a "summarize this paper" request stays local while an
+  # "implement the architecture from this arxiv paper" request goes cloud.
+  task_classes:
+    simple:
+      prefer: local
+      patterns:
+        - '\bsummar'
+        - '\bclassif'
+        - '\bextract'
+        - '\bgreet'
+        - '\bhello'
+        - '\blist files'
+        - '\bexplain'
+    research:
+      prefer: cloud
+      patterns:
+        - '\barxiv'
+        - '\bpaper'
+        - '\bcitation'
+        - '\bpipeline'
+        - '\btheorem'
+        - '\bproof'
+        - '\bderive'
+    code:
+      prefer: cloud
+      patterns:
+        - '\bimplement'
+        - '\brefactor'
+        - '\bdebug'
+        - '\bfix'
+        - '\bbug'
+        - '\berror'
+        - '\bcrash'
+        - '\bfunction'
+        - '\bclass'
+        - '\bmodule'
+        - '\bpatch'
+        - '\bbuild'
+        - '\bcompile'
+        - '\btype[- ]?check'
+        - '\blint'
+        - '\bunit test'
+        - '\bwrite (a )?(function|class|module|test)'
+    reasoning:
+      prefer: cloud
+      patterns:
+        - '\bprove'
+        - '\breason'
+        - '\blogic'
+        - '\balgorithm'
+        - '\bdesign'
+        - '\barchitect'
+
+  # Cloud token budget and behavior once it is exhausted.
+  budget:
+    # null/omitted means unlimited. Tracked from provider-reported token usage.
+    cloud_token_budget: 200000
+    # local         -> prefer the local pool once the budget is spent
+    # cloud_overage -> keep using cloud but mark the decision as low confidence
+    # error         -> refuse cloud calls once the budget is spent
+    over_budget_behavior: local

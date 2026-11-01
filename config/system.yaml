@@ -1,0 +1,277 @@
+# ============================================
+# System Information
+# ============================================
+system:
+  name: "DynamicHarness"
+  version: "1.0.1"
+
+# Reversible context compression. Large tool/worker outputs are stored locally
+# and shown to the model as compact previews with ContextRef handles that can be
+# retrieved via loom_retrieve_context.
+context_engine:
+  min_chars: 2000
+  preview_max_chars: 3000
+
+# Skills are discovered from project and Application `skills/` directories.
+# Only additional local roots need configuration:
+# skills:
+#   paths:
+#     - "shared/skills"
+
+# Hook Bundles are opt-in execution authorization. Declare them here, in an
+# Application system config, or in an Agent config when they are required.
+# Hook directories are never auto-discovered.
+
+# ============================================
+# MCP (Model Context Protocol) Client Configuration
+# ============================================
+# Point to a .mcp.json file (Claude Code compatible format) containing
+# MCP server definitions.  Relative paths resolve from agent_root.
+# Uncomment and adjust to enable global MCP servers for all agents.
+#
+# mcp_servers: "config/.mcp.json"
+#
+# Advanced options:
+# mcp_servers:
+#   path: "config/.mcp.json"
+#   timeout: 30               # connection timeout (seconds)
+#   tool_timeout: 60          # per-tool call timeout (seconds)
+#   tool_name_prefix: true    # add mcp__{server}__ prefix to tool names
+
+
+runtime:
+  root_dir: ".DynamicHarness"
+  trace:
+    mode: "off"
+  successful_run_retention_days: 7
+  failed_run_retention_days: 30
+  artifact_retention_days: 3
+  cleanup_interval_hours: 24
+
+logging:
+  level: "INFO"
+  console_enabled: true
+  file_enabled: true
+  max_file_bytes: 26214400  # 25 MiB per segment
+  backup_count: 3
+
+# ============================================
+# Tool Access Control
+# ============================================
+tool_access_control:
+  # ---- Path validation rules ----
+  # All path access control is configured here.  Only tools listed in
+  # a rule's `tools` array are subject to path checks.  Tools NOT listed
+  # in any rule are allowed without restrictions.
+  #
+  # Each entry supports:
+  #   tools:              list of tool names this rule applies to
+  #   include_paths:      directories to allow outside workspace.
+  #                       Supports ~ expansion, glob patterns (fnmatch),
+  #                       and "*" (allow all paths).
+  #   exclude_paths:      directories to deny access to (relative or absolute).
+  #                       Supports ~ expansion, glob patterns (fnmatch),
+  #                       and "*" (deny all paths).
+  #   path_param_patterns: tool parameter names to treat as file paths
+  #                       (defaults to built-in list: file_path, path, etc.)
+  #
+  # Conflict resolution:
+  #   - exclude takes priority over include (security-first)
+  #   - A tool in multiple rules: include/exclude are merged (union)
+  #   - A tool not in any rule: no path checks applied
+  #
+  path_validation:
+    # ⚠️ SECURITY WARNING: include_paths: ["*"] allows unrestricted file system
+    # access for the listed tools. This means an LLM agent could read sensitive
+    # files (e.g. ~/.ssh/keys, ~/.aws/credentials, /etc/shadow) or write to
+    # arbitrary locations. Only use this in trusted, isolated environments.
+    # For production, replace "*" with specific project directories, e.g.:
+    #   include_paths: ["/home/user/code", "/data/projects"]
+    - tools:
+        - "shell_tool"
+        - "read_file"
+        - "edit_file"
+        - "write_file"
+        - "list_directory"
+        - "grep_search"
+        - "glob_search"
+      include_paths:
+        - "*"
+  # Example:
+  # path_validation:
+  #   - tools: ["shell_tool", "read_file", "edit_file", "grep_search"]
+  #     include_paths: ["~/shared-libs", "/home/*/code"]
+  #     exclude_paths: ["secrets", ".env"]
+  #
+  #   - tools: ["some_unrestricted_tool"]
+  #     include_paths: ["*"]          # allow all paths
+  #
+  #   - tools: ["some_locked_tool"]
+  #     exclude_paths: ["*"]          # deny all paths
+
+# ============================================
+# Checkpoint / Resume 配置
+# ============================================
+checkpoint:
+  enabled: true
+  # 任务成功完成后自动清理 checkpoint（节省磁盘）
+  cleanup_on_success: true
+  # checkpoint 最大保留时间（秒），默认 7 天
+  max_resume_age: 604800
+  # 心跳写入间隔（秒）
+  heartbeat_interval: 5
+
+# ============================================
+# Content redaction (Applications may override this default)
+# ============================================
+redaction:
+  enabled: true
+
+# ============================================
+# Tool Metadata Configuration
+# ============================================
+# Per-tool runtime metadata.  Keys are canonical tool names.
+# The ``default`` key provides fallback values for unconfigured tools.
+# Agent YAML can override per-tool metadata via ``tools[].xxx``.
+tool_metadata:
+  grep_search:
+    max_result_chars: 20000
+    is_concurrency_safe: true
+    category: search
+  glob_search:
+    max_result_chars: 10000
+    is_concurrency_safe: true
+    category: search
+  shell_tool:
+    # shell_tool already truncates large command output to a head/tail preview
+    # and embeds the full-output artifact path in that preview. Keep the outer
+    # tool shim threshold above shell_tool's own preview size so the artifact
+    # notice remains visible to the agent.
+    max_result_chars: 40000
+    is_concurrency_safe: false
+    category: shell
+  check_background_task:
+    max_result_chars: 5000
+    is_concurrency_safe: true
+    category: shell
+  kill_background_task:
+    max_result_chars: 3000
+    is_concurrency_safe: false
+    category: shell
+  list_background_tasks:
+    max_result_chars: 5000
+    is_concurrency_safe: true
+    category: shell
+  loom_retrieve_context:
+    max_result_chars: null
+    is_concurrency_safe: true
+    category: context
+  read_file:
+    max_result_chars: null          # exempt — handled by context compression dedup
+    is_concurrency_safe: true
+    category: file_ops
+  edit_file:
+    max_result_chars: 20000
+    is_concurrency_safe: true
+    category: file_ops
+  write_file:
+    max_result_chars: 20000
+    is_concurrency_safe: true
+    category: file_ops
+  list_directory:
+    max_result_chars: 12000
+    is_concurrency_safe: true
+    category: file_ops
+  default:
+    max_result_chars: 20000
+    is_concurrency_safe: true
+    category: general
+
+# ============================================
+# Tool Output Limits (context compression layer)
+# ============================================
+# Overrides the hardcoded TOOL_MAX_RETAIN_CHARS in context_compression.py.
+# Set to null to exempt a tool (e.g. read_file uses dedup instead).
+# tool_output_limits:
+#   grep_search: 3000
+#   shell_tool: 2000
+#   default: 3000
+
+# ============================================
+# Default Toolsets
+# ============================================
+# Toolsets loaded by default for every agent. Agent YAML `toolsets:` replaces
+# this list entirely; `toolsets: []` means no built-in tools.
+default_toolsets:
+  - "core_shell"
+  - "core_file"
+  - "core_search"
+  - "context"
+  - "skills"
+
+# ============================================
+# Shell Settings
+# ============================================
+# Security, path validation, background tasks, and audit log configuration
+# for shell_tool.  Can be overridden per-agent via agent YAML `shell_settings:`.
+shell_settings:
+  # Allowed command names for shell_tool; "*" means allow all command names.
+  # Example: ["ls", "cat", "grep", "find"] to restrict to read-only commands.
+  allowed_commands: "*"
+  # Allowed shell operators; "*" means allow all operators.
+  # Example: ["|", "&&"] to restrict dangerous operators.
+  allowed_operators: "*"
+
+  # System-critical paths where destructive operations (rm, rmdir) are blocked.
+  dangerous_paths:
+    - "/"
+    - "/etc"
+    - "/usr"
+    - "/var"
+    - "/boot"
+    - "/sys"
+    - "/proc"
+    - "/home"
+    - "/root"
+    - "/dev"
+    - "/lib"
+    - "/lib64"
+    - "/bin"
+    - "/sbin"
+    - "/opt"
+    - "/srv"
+    - "/tmp"
+  # Enable/disable blocking destructive operations on dangerous paths.
+  block_destructive: true
+
+  # Security check toggles (all default to true when absent).
+  # Each check can be individually disabled for specific use cases.
+  # See docs/cn/system_config.md §8 for details.
+  security_checks:
+    command_substitution: true     # Block $() and backticks
+    parameter_expansion: true      # Block ${}
+    process_substitution: true     # Block <(), >()
+    env_injection: true            # Block LD_PRELOAD, PATH injection
+    control_characters: true       # Block hidden control characters
+    dangerous_shell_prefix: true   # Block sudo, bash -c, env, etc.
+    zsh_dangerous_commands: true   # Block zmodload, ztcp, etc.
+    incomplete_commands: true      # Block incomplete command fragments
+    ifs_injection: true            # Block IFS manipulation
+    destructive_patterns: true     # Block rm -rf /, mkfs, etc.
+
+  # Background task management
+  background_tasks:
+    enabled: true
+    max_concurrent: 10
+    auto_background_on_timeout: true
+    max_output_bytes: 104857600   # 100 MB per task
+    stall_detection: true
+    stall_threshold_seconds: 45
+
+  # Per-agent shell security audit log.
+  # Writes structured events (blocks, stalls, timeouts, path violations)
+  # to the active run's audit/shell.jsonl (10 MiB, 2 backups).
+  audit_log:
+    enabled: true           # Master switch (default: true)
+    log_policy_snapshot: true  # Log effective shell policy once per run
+    log_success: false      # Also log successful executions (default: false)

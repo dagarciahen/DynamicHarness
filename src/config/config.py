@@ -1,0 +1,780 @@
+"""
+Unified configuration management.
+
+Configuration precedence (low -> high):
+1. config/system.yaml
+2. config/model.yaml
+3. applications/<app>/config/system.yaml  (optional, resolved via Agent YAML path)
+4. applications/<app>/config/model.yaml   (whole named model profiles replace project profiles)
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+from collections.abc import Mapping
+from contextlib import contextmanager
+from contextvars import ContextVar
+from copy import deepcopy
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+import yaml
+
+from .config_validation import (
+    RootSettings,
+    normalize_tool_access_control_section,
+    raise_project_key_error,
+    validate_system_snapshot,
+)
+from .defaults import DEFAULT_MODEL_REQUESTS_PER_MINUTE
+from .layered_builder import LayeredConfigBuilder
+from .llm_config import LLMConfig
+from .paths import normalize_config_paths
+from .system_loader import (
+    filter_llm_only_top_level_keys as _filter_llm_only_top_level_keys,
+)
+from .system_loader import load_config_mapping as _load_yaml
+from .system_loader import load_project_system_config
+from .yaml_loader import load_unique_yaml
+
+SYSTEM_CONFIG_NAME = "system.yaml"
+MODEL_CONFIG_NAME = "model.yaml"
+LOCAL_MODEL_CONFIG_NAME = "model.local.yaml"
+_CAMPAIGN_LLM_CONFIG_FD_ENV = "DynamicHarness_MEMORY_CAMPAIGN_LLM_CONFIG_FD"
+_MAX_CAMPAIGN_LLM_CONFIG_BYTES = 1024 * 1024
+_HARNESS_MODEL_CONFIG: ContextVar[LLMConfig | None] = ContextVar("DynamicHarness_harness_private_model_config", default=None)
+
+
+def current_harness_model_config() -> dict | None:
+    """Export a private catalog only to a trusted anonymous child transport."""
+    catalog = _HARNESS_MODEL_CONFIG.get()
+    return None if catalog is None else catalog.model_dump(mode="json")
+
+
+@contextmanager
+def bind_harness_model_config(raw: Mapping[str, Any] | None):
+    """Bind the trusted child's already-consumed anonymous configuration pipe.
+
+    The effective model catalog remains in memory. Candidate files contain
+    references only and must never replace these values with credential markers.
+    """
+    catalog = None
+    if raw is not None:
+        catalog = LLMConfig.model_validate(dict(raw)) if "models" in raw else LLMConfig.from_dict(dict(raw))
+    token = _HARNESS_MODEL_CONFIG.set(catalog)
+    try:
+        yield
+    finally:
+        _HARNESS_MODEL_CONFIG.reset(token)
+APP_CONFIG_RELATIVE_PATH = Path("config") / SYSTEM_CONFIG_NAME
+_PROJECT_NAME = "DynamicHarness"
+_WORKFLOW_OVERLAY_KEYS = {
+    "system",
+    "runtime_options",
+    "context_engine",
+    "tool_access_control",
+    "tools",
+    "tool_metadata",
+    "tool_output_limits",
+    "shell_settings",
+    "default_toolsets",
+    "toolsets",
+    "mcp_servers",
+    "hooks",
+    "skills",
+}
+_GLOBAL_ONLY_TOP_LEVEL_KEYS = {"runtime", "logging"}
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True, slots=True)
+class ConfigLayerSnapshot:
+    """One immutable-by-convention configuration source with path provenance."""
+
+    name: str
+    data: dict[str, Any]
+    root: Path
+    source_path: Path
+
+
+@dataclass(frozen=True, slots=True)
+class EffectiveAgentConfigSnapshot:
+    """Merged values plus the unmerged sources used to produce them."""
+
+    values: dict[str, Any]
+    layers: tuple[ConfigLayerSnapshot, ...]
+    llm: LLMConfig | None = field(default=None, repr=False)
+
+
+def _load_llm_config(path: Path) -> LLMConfig:
+    """Load one capsule-only config pipe, otherwise use the normal disk file.
+
+    Only the numeric descriptor is transported in the environment.  The
+    credential-bearing payload is consumed exactly once and the descriptor is
+    closed before any tool or provider subprocess can inherit it.
+    """
+    bound_harness = _HARNESS_MODEL_CONFIG.get()
+    if bound_harness is not None:
+        return bound_harness.model_copy(deep=True)
+    fd_value = ""
+    if os.environ.get("DynamicHarness_MEMORY_CAMPAIGN_CAPSULE_ACTIVE") == "1":
+        fd_value = str(os.environ.pop(_CAMPAIGN_LLM_CONFIG_FD_ENV, "") or "")
+    if not fd_value:
+        return LLMConfig.load_from_yaml(path)
+    try:
+        fd = int(fd_value)
+        if fd < 0:
+            raise ValueError
+    except ValueError as exc:
+        raise ValueError("invalid in-memory campaign LLM configuration") from exc
+    try:
+        with os.fdopen(fd, "rb", closefd=True) as stream:
+            raw_bytes = stream.read(_MAX_CAMPAIGN_LLM_CONFIG_BYTES + 1)
+        if len(raw_bytes) > _MAX_CAMPAIGN_LLM_CONFIG_BYTES:
+            raise ValueError("in-memory campaign LLM configuration is too large")
+        raw = load_unique_yaml(raw_bytes.decode("utf-8")) or {}
+    except (OSError, UnicodeDecodeError, ValueError, yaml.YAMLError) as exc:
+        raise ValueError("invalid in-memory campaign LLM configuration") from exc
+    if not isinstance(raw, dict):
+        raise ValueError("in-memory campaign LLM configuration must be a mapping")
+    return LLMConfig.from_dict(raw)
+
+
+def _reject_application_global_only_keys(
+    config_map: dict[str, Any] | None,
+    *,
+    source_name: str,
+) -> dict[str, Any]:
+    """Reject configuration that would pretend to override global storage.
+
+    Application config may tune checkpoint behavior, but allowing it to move
+    ``runtime.root_dir`` would fragment task discovery and retention across
+    unrelated roots in the same process.  Silently dropping these keys is also
+    unsafe because the caller would reasonably believe the override applied.
+    """
+
+    filtered = dict(config_map or {})
+    disallowed = sorted(_GLOBAL_ONLY_TOP_LEVEL_KEYS.intersection(filtered))
+    if disallowed:
+        keys = ", ".join(disallowed)
+        raise ValueError(
+            f"Unsupported global-only key(s) in {source_name}: {keys}. "
+            "Configure runtime and logging only in the project root "
+            "config/system.yaml."
+        )
+    return filtered
+
+
+def _is_dynamicharness_project(pyproject_path: Path) -> bool:
+    """Return *True* if *pyproject_path* declares ``project.name == _PROJECT_NAME``."""
+    try:
+        import tomllib  # Python 3.11+
+    except ModuleNotFoundError:  # pragma: no cover
+        import tomli as tomllib  # type: ignore[no-redef]
+    try:
+        with open(pyproject_path, "rb") as f:
+            data = tomllib.load(f)
+        return data.get("project", {}).get("name") == _PROJECT_NAME
+    except Exception:
+        return False
+
+
+def _discover_agent_root(config_dir: Path | str | None = None) -> Path:
+    """Locate the project root directory.
+
+    Detection strategy:
+
+    * When *config_dir* is given (e.g. from tests), it is used directly –
+      expected to point at the ``config/`` directory that contains
+      ``system.yaml``.
+    * ``DynamicHarness_PROJECT_ROOT`` selects a project explicitly for installed
+      execution outside its checkout. Invalid explicit input fails directly.
+    * Otherwise the function walks **upward** from the current working
+      directory and from the package source tree (``__file__``) looking for
+      a ``pyproject.toml`` whose ``[project] name`` equals
+      :data:`_PROJECT_NAME` (``DynamicHarness``).  This avoids false matches
+      with sub-projects that also ship a ``config/system.yaml``.
+    """
+    if config_dir is not None:
+        configured_dir = Path(config_dir).expanduser().resolve()
+        system_file = configured_dir / SYSTEM_CONFIG_NAME
+        if not system_file.exists():
+            raise FileNotFoundError(
+                f"Configured config directory '{configured_dir}' does not "
+                f"contain '{SYSTEM_CONFIG_NAME}'. Please verify the path."
+            )
+        return configured_dir.parent
+
+    explicit_root = os.environ.get("DynamicHarness_PROJECT_ROOT")
+    if explicit_root is not None:
+        root = Path(explicit_root).expanduser().resolve()
+        if not explicit_root.strip() or not (root / "config" / SYSTEM_CONFIG_NAME).is_file():
+            raise FileNotFoundError(
+                f"DynamicHarness_PROJECT_ROOT '{explicit_root}' must contain "
+                f"config/{SYSTEM_CONFIG_NAME}."
+            )
+        return root
+
+    search_origins = [
+        ("current working directory", Path.cwd().resolve()),
+        ("source tree", Path(__file__).resolve().parent),
+    ]
+    for _label, start in search_origins:
+        current = start
+        while current != current.parent:
+            candidate = current / "pyproject.toml"
+            if candidate.exists() and _is_dynamicharness_project(candidate):
+                return current
+            current = current.parent
+
+    searched = ", ".join(f"{label} ({path})" for label, path in search_origins)
+    raise FileNotFoundError(
+        f"Cannot locate the {_PROJECT_NAME} project root. "
+        f"Searched upward from: {searched}. "
+        f"Expected to find a pyproject.toml with [project] name = '{_PROJECT_NAME}'. "
+        f"Hint: set DynamicHarness_PROJECT_ROOT to the project directory or run "
+        f"from within the project tree."
+    )
+
+
+def _resolve_app_root_from_yaml(
+    agent_root: Path,
+    yaml_config_path: Path,
+    *,
+    source_path_is_pinned: bool = False,
+) -> Path:
+    """Determine the application root from an Agent YAML file path.
+
+    Walks **upward** from *yaml_config_path* looking for a directory whose
+    name is ``workflows``.  The parent of that directory is the application
+    root.  If the resolved app root lives under ``<agent_root>/applications/``
+    and contains an optional ``config/system.yaml``, that file will be used
+    as an application-level overlay by :func:`build_effective_agent_config`.
+
+    Raises:
+        ValueError: If no ``workflows/`` directory can be found in the
+            ancestor chain — every application **must** have one.
+    """
+    if source_path_is_pinned:
+        source_path = Path(os.path.normpath(yaml_config_path))
+        try:
+            source_path.relative_to(agent_root)
+        except ValueError as exc:
+            raise ValueError("Pinned Agent source path must stay inside the project") from exc
+    else:
+        source_path = yaml_config_path.resolve()
+    current = source_path.parent
+    while current != current.parent:
+        if current.name == "workflows":
+            app_root = current.parent
+            # Verify app_root is under agent_root/applications/
+            applications_root = agent_root / "applications"
+            try:
+                app_root.relative_to(applications_root)
+                return app_root
+            except ValueError:
+                return agent_root
+        if current == agent_root:
+            break
+        current = current.parent
+
+    raise ValueError(
+        f"Cannot locate 'workflows/' directory from {yaml_config_path}. "
+        "Every application must contain a workflows/ directory."
+    )
+
+
+class UnifiedConfig:
+    def __init__(self, raw: dict[str, Any], agent_root: Path, llm_config: LLMConfig):
+        normalized = dict(raw)
+        if "project" in normalized:
+            raise raise_project_key_error("merged config")
+
+        normalize_tool_access_control_section(normalized, agent_root)
+        validate_system_snapshot(normalized, "merged config")
+
+        self._raw = normalized
+        self._settings = RootSettings.model_validate(self._raw)
+        self._agent_root = agent_root
+        self._llm_config = llm_config
+        self._loaded_raw: dict[str, Any] | None = None
+        self._loaded_llm: dict[str, Any] | None = None
+
+    @property
+    def raw(self) -> dict[str, Any]:
+        return self._raw
+
+    @property
+    def agent_root(self) -> Path:
+        return self._agent_root
+
+    def get(self, key: str, default: Any = None) -> Any:
+        return self._raw.get(key, default)
+
+    def get_nested(self, *keys: str, default: Any = None) -> Any:
+        value: Any = self._raw
+        for key in keys:
+            if isinstance(value, dict) and key in value:
+                value = value[key]
+            else:
+                return default
+        return value
+
+    def get_model_config(self, model_type: str, key: str, default: Any = None) -> Any:
+        specific = self._llm_config.models.get(model_type)
+        if specific is not None and hasattr(specific, key):
+            val = getattr(specific, key)
+            if val is not None and val != "":
+                return val
+        return default
+
+    @property
+    def system_name(self) -> str:
+        return self._settings.system.name
+
+    @property
+    def system_version(self) -> str:
+        return self._settings.system.version
+
+    @property
+    def default_model_type(self) -> str:
+        return self._llm_config.default_model_type
+
+    @property
+    def requests_per_minute(self) -> int:
+        try:
+            return self._llm_config.for_type(None).requests_per_minute
+        except ValueError:
+            return DEFAULT_MODEL_REQUESTS_PER_MINUTE
+
+    @property
+    def llm_base_url(self) -> str:
+        try:
+            return self._llm_config.for_type(None).base_url
+        except ValueError:
+            return ""
+
+    @property
+    def llm_api_key(self) -> str:
+        try:
+            api_key = self._llm_config.for_type(None).api_key
+        except ValueError:
+            api_key = ""
+        return api_key if api_key else "not_provided"
+
+    @property
+    def llm(self) -> LLMConfig:
+        return self._llm_config
+
+    @property
+    def langfuse_host(self) -> str:
+        return self._llm_config.langfuse.host
+
+    @property
+    def langfuse_public_key(self) -> str:
+        return self._llm_config.langfuse.public_key
+
+    @property
+    def langfuse_private_key(self) -> str:
+        return self._llm_config.langfuse.private_key
+
+
+_ACTIVE_CONFIG: UnifiedConfig | None = None
+_INVOCATION_CONFIG: ContextVar[UnifiedConfig | None] = ContextVar("DynamicHarness_config", default=None)
+_AGENT_MODEL_CONFIG: ContextVar[LLMConfig | None] = ContextVar("DynamicHarness_model_config", default=None)
+
+
+def _load_merged_config(config_dir: Path | str | None = None) -> UnifiedConfig:
+    """Load global base configuration: ``config/system.yaml`` + ``config/model.yaml``.
+
+    Application-level overlays (``applications/<app>/config/system.yaml``) are
+    **not** handled here — they are resolved later in
+    :func:`build_effective_agent_config` using the Agent YAML file path.
+    """
+    agent_root = _discover_agent_root(config_dir=config_dir)
+
+    return load_project_config(agent_root)
+
+
+def load_project_config(project_root: Path | str) -> UnifiedConfig:
+    """Read an explicit project without mutating the process-wide config."""
+    agent_root = Path(project_root).expanduser().resolve()
+    config_root = agent_root / "config"
+    merged = load_project_system_config(agent_root, require_exists=False)
+    llm_config = _load_llm_config(config_root / MODEL_CONFIG_NAME)
+    config = UnifiedConfig(merged, agent_root=agent_root, llm_config=llm_config)
+    # Programmatic configs and the credential-pipe campaign are explicit
+    # overrides. Only unchanged disk-loaded bases may be refreshed for a Run.
+    if os.environ.get("DynamicHarness_MEMORY_CAMPAIGN_CAPSULE_ACTIVE") != "1" and _HARNESS_MODEL_CONFIG.get() is None:
+        config._loaded_raw = deepcopy(config.raw)
+        config._loaded_llm = config.llm.model_dump()
+    return config
+
+
+def get_config() -> UnifiedConfig:
+    bound = _INVOCATION_CONFIG.get()
+    if bound is not None:
+        return bound
+    global _ACTIVE_CONFIG
+    if _ACTIVE_CONFIG is None:
+        _ACTIVE_CONFIG = _load_merged_config()
+    return _ACTIVE_CONFIG
+
+
+def fresh_invocation_config(base: UnifiedConfig) -> UnifiedConfig:
+    """Read current disk sources without changing another invocation's config."""
+    loaded_raw = getattr(base, "_loaded_raw", None)
+    loaded_llm = getattr(base, "_loaded_llm", None)
+    if loaded_raw is not None and base.raw == loaded_raw and base.llm.model_dump() == loaded_llm:
+        return load_project_config(base.agent_root)
+    return deepcopy(base)
+
+
+@contextmanager
+def bind_config(config: UnifiedConfig):
+    """Pin the global configuration source for one invocation and its Workers."""
+    token = _INVOCATION_CONFIG.set(config)
+    try:
+        yield config
+    finally:
+        _INVOCATION_CONFIG.reset(token)
+
+
+@contextmanager
+def bind_model_config(catalog: LLMConfig | None):
+    """Bind one Agent's models without changing the project base for its Workers."""
+    token = _AGENT_MODEL_CONFIG.set(catalog)
+    try:
+        yield catalog
+    finally:
+        _AGENT_MODEL_CONFIG.reset(token)
+
+
+class ConfigProxy:
+    def __getitem__(self, key: str) -> Any:
+        return get_config().raw[key]
+
+    def get(self, key: str, default: Any = None) -> Any:
+        return get_config().get(key, default=default)
+
+    def get_nested(self, *keys: str, default: Any = None) -> Any:
+        return get_config().get_nested(*keys, default=default)
+
+    def get_model_config(self, model_type: str, key: str, default: Any = None) -> Any:
+        settings = self.llm.models.get(model_type)
+        value = getattr(settings, key, None)
+        return value if value is not None and value != "" else default
+
+    @property
+    def llm(self) -> LLMConfig:
+        bound = _AGENT_MODEL_CONFIG.get()
+        return bound if bound is not None else get_config().llm
+
+    @property
+    def raw(self) -> dict[str, Any]:
+        return get_config().raw
+
+    @property
+    def agent_root(self) -> Path:
+        return get_config().agent_root
+
+    @property
+    def system_name(self) -> str:
+        return get_config().system_name
+
+    @property
+    def system_version(self) -> str:
+        return get_config().system_version
+
+    @property
+    def default_model_type(self) -> str:
+        return self.llm.default_model_type
+
+    @property
+    def requests_per_minute(self) -> int:
+        try:
+            return self.llm.for_type(None).requests_per_minute
+        except ValueError:
+            return DEFAULT_MODEL_REQUESTS_PER_MINUTE
+
+    @property
+    def llm_base_url(self) -> str:
+        try:
+            return self.llm.for_type(None).base_url
+        except ValueError:
+            return ""
+
+    @property
+    def llm_api_key(self) -> str:
+        try:
+            return self.llm.for_type(None).api_key or "not_provided"
+        except ValueError:
+            return "not_provided"
+
+    @property
+    def langfuse_host(self) -> str:
+        return get_config().langfuse_host
+
+    @property
+    def langfuse_public_key(self) -> str:
+        return get_config().langfuse_public_key
+
+    @property
+    def langfuse_private_key(self) -> str:
+        return get_config().langfuse_private_key
+
+
+C = ConfigProxy()
+
+
+def extract_workflow_overlay(
+    config_map: dict[str, Any],
+    *,
+    source_name: str = "workflow config",
+) -> dict[str, Any]:
+    if "redaction" in config_map:
+        raise ValueError(
+            f"redaction is not configurable in Agent YAML ({source_name}); "
+            "use the global or Application config/system.yaml"
+        )
+    if "project" in config_map:
+        source = str(config_map.get("_yaml_file_path") or config_map.get("name") or "workflow config")
+        raise raise_project_key_error(source)
+
+    filtered_map = _reject_application_global_only_keys(
+        config_map,
+        source_name=source_name,
+    )
+    filtered_map = _filter_llm_only_top_level_keys(
+        filtered_map,
+        source_name=source_name,
+    )
+    # Keep invalid values visible to the shared validator: silently discarding
+    # a malformed override would execute a different lower-precedence value.
+    return {key: deepcopy(value) for key, value in filtered_map.items()
+            if key in _WORKFLOW_OVERLAY_KEYS}
+
+
+def build_effective_agent_config_snapshot(
+    agent_config: dict[str, Any] | None,
+    *,
+    source_name: str = "agent",
+    base_config: UnifiedConfig | None = None,
+    source_path_is_pinned: bool = False,
+    application_config: Mapping[str, Any] | None = None,
+) -> EffectiveAgentConfigSnapshot:
+    """Build merged Agent values while retaining every unmerged source.
+
+    Merge order (low → high):
+    1. Global base (``config/system.yaml`` + ``config/model.yaml``)
+    2. Application overlay (``<app_root>/config/system.yaml``, optional)
+    3. Agent YAML overlay
+
+    The application root is determined by walking **upward** from the Agent
+    YAML file path (stored in ``agent_config["_yaml_file_path"]``) until a
+    ``workflows/`` directory is found.
+    """
+    pinned = (agent_config or {}).get("_effective_agent_config_snapshot")
+    if isinstance(pinned, EffectiveAgentConfigSnapshot):
+        return deepcopy(pinned)
+    base = base_config if base_config is not None else get_config()
+    if base_config is None and _INVOCATION_CONFIG.get() is None:
+        base = fresh_invocation_config(base)
+    llm_config = base.llm.model_copy(deep=True)
+    model_source = (agent_config or {}).get("_model_source_path") or (agent_config or {}).get("_yaml_file_path")
+    if model_source:
+        try:
+            model_root = _resolve_app_root_from_yaml(base.agent_root, Path(str(model_source)))
+        except ValueError:
+            pass  # Programmatic Agents without an Application use project models.
+        else:
+            if model_root != base.agent_root and _HARNESS_MODEL_CONFIG.get() is None:
+                llm_config = base.llm.overlay_from_yaml(model_root / "config" / MODEL_CONFIG_NAME)
+                llm_config = llm_config.patch_from_yaml(
+                    model_root / "config" / LOCAL_MODEL_CONFIG_NAME
+                )
+    layers: list[ConfigLayerSnapshot] = []
+    layered_builder = LayeredConfigBuilder(
+        validate_hook=lambda snapshot, overlay: validate_system_snapshot(snapshot, overlay.name)
+    )
+    base_data = deepcopy(base.raw)
+    app_system_yaml: dict[str, Any] = {}
+    layered_builder.apply_mapping("base_config", normalize_config_paths(base_data, base.agent_root))
+    layers.append(
+        ConfigLayerSnapshot(
+            name="global_system",
+            data=deepcopy(base_data),
+            root=base.agent_root.resolve(),
+            source_path=(base.agent_root / "config" / SYSTEM_CONFIG_NAME).resolve(),
+        )
+    )
+
+    # --- Application-level overlay (resolved from _yaml_file_path) ---
+    agent_layer_root = base.agent_root.resolve()
+    agent_source_path = Path(source_name).expanduser()
+    if isinstance(agent_config, dict):
+        yaml_file_path = agent_config.get("_yaml_file_path")
+        if yaml_file_path:
+            raw_source_path = Path(str(yaml_file_path)).expanduser()
+            agent_source_path = (
+                Path(os.path.normpath(raw_source_path))
+                if source_path_is_pinned
+                else raw_source_path.resolve()
+            )
+            try:
+                app_root = _resolve_app_root_from_yaml(
+                    base.agent_root,
+                    agent_source_path,
+                    source_path_is_pinned=source_path_is_pinned,
+                )
+            except ValueError:
+                logger.warning(
+                    "Skipped application config discovery for '%s': "
+                    "no workflows/ directory found.",
+                    yaml_file_path,
+                )
+            else:
+                agent_layer_root = (
+                    app_root
+                    if source_path_is_pinned
+                    else app_root.resolve()
+                )
+                app_config_path = app_root / APP_CONFIG_RELATIVE_PATH
+                if app_root != base.agent_root:
+                    if source_path_is_pinned and application_config is None:
+                        raise ValueError(
+                            "Pinned Agent source requires a captured Application config"
+                        )
+                    app_system_yaml = _filter_llm_only_top_level_keys(
+                        (
+                            deepcopy(dict(application_config))
+                            if application_config is not None
+                            else _load_yaml(app_config_path)
+                        ),
+                        source_name=str(app_config_path),
+                    )
+                    app_system_yaml = _reject_application_global_only_keys(
+                        app_system_yaml,
+                        source_name=str(app_config_path),
+                    )
+                    layered_builder.apply_mapping(
+                        str(app_config_path), normalize_config_paths(app_system_yaml, agent_layer_root)
+                    )
+                    layers.append(
+                        ConfigLayerSnapshot(
+                            name="application_system",
+                            data=deepcopy(app_system_yaml),
+                            root=agent_layer_root,
+                            source_path=(
+                                app_config_path
+                                if source_path_is_pinned
+                                else app_config_path.resolve()
+                            ),
+                        )
+                    )
+
+    # --- Agent YAML overlay ---
+    if isinstance(agent_config, dict):
+        agent_overlay = extract_workflow_overlay(
+            deepcopy(agent_config), source_name=source_name
+        )
+        layered_builder.apply_mapping(
+            source_name,
+            normalize_config_paths(agent_overlay, agent_layer_root),
+        )
+        if agent_overlay:
+            if not agent_source_path.is_absolute():
+                agent_source_path = (agent_layer_root / agent_source_path).resolve()
+            layers.append(
+                ConfigLayerSnapshot(
+                    name="agent",
+                    data=deepcopy(agent_overlay),
+                    root=agent_layer_root,
+                    source_path=agent_source_path,
+                )
+            )
+    merged = layered_builder.build()
+    normalized = RootSettings.model_validate(merged).model_dump(exclude_unset=True)
+    merged.update(normalized)
+    normalize_tool_access_control_section(merged, base.agent_root)
+    validate_system_snapshot(merged, source_name)
+    if isinstance(agent_config, dict) and agent_config.get("_yaml_file_path"):
+        # Identity metadata, not configuration: application-scope resolution
+        # (self-learning memory layering, learning artifacts) reads the workflow
+        # path from the effective config at hook time.
+        merged["_yaml_file_path"] = str(agent_config["_yaml_file_path"])
+    for layer in layers:
+        if "default_toolsets" in layer.data:
+            merged["_default_toolsets_source"] = layer.name
+    return EffectiveAgentConfigSnapshot(values=merged, layers=tuple(layers), llm=llm_config)
+
+
+def rebind_effective_agent_config_snapshot(agent_config: dict[str, Any]) -> EffectiveAgentConfigSnapshot:
+    """Apply trusted invocation bindings to captured configuration sources.
+
+    A prepared definition already has a pinned snapshot. Ordinary construction
+    deliberately reuses it, so mutating raw tools/hooks alone cannot bind host
+    dependencies. Recompile the Agent layer without rereading system or model
+    files, preserving the Application's original source and model snapshot.
+    """
+    pinned = agent_config.get("_effective_agent_config_snapshot")
+    if not isinstance(pinned, EffectiveAgentConfigSnapshot):
+        return build_effective_agent_config_snapshot(agent_config)
+    layers = list(deepcopy(pinned.layers))
+    agent_layer = next((layer for layer in reversed(layers) if layer.name == "agent"), None)
+    if agent_layer is None:
+        raise ValueError("Prepared Agent snapshot is missing its Agent source")
+    overlay = extract_workflow_overlay(agent_config, source_name=str(agent_layer.source_path))
+    replacement = ConfigLayerSnapshot("agent", overlay, agent_layer.root, agent_layer.source_path)
+    layers = [replacement if layer is agent_layer else layer for layer in layers]
+    builder = LayeredConfigBuilder(
+        validate_hook=lambda snapshot, source: validate_system_snapshot(snapshot, source.name)
+    )
+    for layer in layers:
+        builder.apply_mapping(str(layer.source_path), normalize_config_paths(layer.data, layer.root))
+    merged = builder.build()
+    merged.update(RootSettings.model_validate(merged).model_dump(exclude_unset=True))
+    global_root = layers[0].root
+    normalize_tool_access_control_section(merged, global_root)
+    validate_system_snapshot(merged, str(agent_layer.source_path))
+    if agent_config.get("_yaml_file_path"):
+        merged["_yaml_file_path"] = str(agent_config["_yaml_file_path"])
+    for layer in layers:
+        if "default_toolsets" in layer.data:
+            merged["_default_toolsets_source"] = layer.name
+    if "_mcp_settings_snapshot" in pinned.values:
+        if merged.get("mcp_servers") != pinned.values.get("mcp_servers"):
+            raise ValueError("Trusted invocation bindings cannot replace captured MCP sources")
+        merged["_mcp_settings_snapshot"] = deepcopy(pinned.values["_mcp_settings_snapshot"])
+    return EffectiveAgentConfigSnapshot(merged, tuple(layers), deepcopy(pinned.llm))
+
+
+def build_effective_agent_config(
+    agent_config: dict[str, Any] | None,
+    *,
+    source_name: str = "agent",
+) -> dict[str, Any]:
+    """Build the final merged config for a single Agent."""
+
+    return build_effective_agent_config_snapshot(
+        agent_config,
+        source_name=source_name,
+    ).values
+
+
+def get_model_config(model_type: str, key: str, default: Any = None) -> Any:
+    return C.get_model_config(model_type, key, default=default)
+
+
+def get_default_toolsets(config_map: dict[str, Any] | None = None) -> list[str]:
+    if config_map is not None:
+        toolsets = config_map.get("default_toolsets", [])
+    else:
+        toolsets = C.get("default_toolsets", [])
+
+    if not isinstance(toolsets, list):
+        return []
+    return [toolset for toolset in toolsets if isinstance(toolset, str) and toolset.strip()]
