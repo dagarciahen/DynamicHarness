@@ -17,7 +17,7 @@
 </p>
 
 DynamicHarness is a general agent harness adapted from
-[AgentLoom](https://github.com/linora-u/AgentLoom). On top of the base agent loop it adds one differentiating layer — a **dynamic model router** — and ships `paper2code` and `general-programming` as on-demand **Skills**.
+[AgentLoom](https://github.com/linora-u/AgentLoom). On top of the base agent loop it adds one differentiating layer a **dynamic model router** and ships `paper2code` and `general-programming` as **Skills**.
 
 ## Why DynamicHarness
 
@@ -27,11 +27,11 @@ The same agent runs against a local model, a cloud API, or both. A
 `RoutingPolicy` declares local and cloud **pools** (sets of `model_type` values)
 and **task classes**. For every model turn the router picks a pool and model by matching the turn against three signals:
 
-1. **Task type** — simple turns (summarize, extract, greet) prefer local;
+1. **Task type:**  simple turns (summarize, extract, greet) prefer local;
    `research`/`code`/`reasoning` turns prefer cloud.
-2. **Resource load** — the local pool is skipped when Ollama is unreachable or
+2. **Resource load:** the local pool is skipped when Ollama is unreachable or
    above `local_max_load` (an injectable health probe).
-3. **Budget** — a token counter fed by provider-reported usage; when
+3. **Budget:** a token counter fed by provider-reported usage; when
    `cloud_token_budget` is spent, `over_budget_behavior` decides (default: fall
    back to local).
 
@@ -41,9 +41,9 @@ Every decision is recorded with its pool, model, task class, reason, and confide
 
 Skills are Markdown instruction packages (`SKILL.md`) plus optional scripts that the harness discovers by frontmatter metadata and loads only when a task matches their description. The harness has no skill-specific logic.
 
-- **`paper2code`** — converts an arxiv paper into a minimal, citation-anchored
+- **`paper2code:`** converts an arxiv paper into a minimal, citation-anchored
   Python implementation (adapted from [paper2code](https://github.com/PrathamLearnsToCode/paper2code)).
-- **`general-programming`** — everyday software engineering: implement, fix,
+- **`general-programming:`**  everyday software engineering: implement, fix,
   refactor, test, and review code.
 
 ### Hand-written, permissions outside the model
@@ -118,7 +118,7 @@ config/
 uv sync --group dev
 # Linux/macOS
 .venv/bin/python -m pytest tests/model_router_test -v
-# Windows
+# Windows --> TODO
 .venv\Scripts\python.exe -m pytest tests\model_router_test -v
 ```
 
