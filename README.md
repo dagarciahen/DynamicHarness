@@ -48,7 +48,7 @@ Skills are Markdown instruction packages (`SKILL.md`) plus optional scripts that
 
 ### Hand-written, permissions outside the model
 
-File read/write, shell execution, tests, and permissions are governed outside the model. No LangChain, no hidden authority for extensions.
+File read/write, shell execution, tests, and permissions are governed outside the model.
 
 ## Quick start
 
@@ -88,9 +88,10 @@ model:
     api_key: "ollama"
   powerful:          # cloud pool (DeepSeek)
     adapter: openai_chat
-    model: "deepseek/deepseek-chat"
-    base_url: "https://api.deepseek.com"
-    api_key: "<deepseek-api-key>"
+    model: "openai/<fast-model-id>"
+    api_key: "<api-key>"
+    base_url: "https://<openai-compatible-endpoint>"
+    tool_choice: "auto"
 ```
 
 `AGENTLOOM_MODEL_ROUTER_CONFIG=/path/to/policy.yaml` overrides the policy file location for a single invocation. See [`docs/en/model_routing.md`](docs/en/model_routing.md) for the full contract.
